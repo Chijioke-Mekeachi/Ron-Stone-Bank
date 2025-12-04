@@ -172,12 +172,7 @@ const Login = () => {
             </p>
           </div>
 
-          {/* Demo credentials hint */}
-          <div className="mt-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-            <p className="text-sm text-blue-800 text-center">
-              <strong>Demo:</strong> Use any email and password to test the login
-            </p>
-          </div>
+          
         </div>
       </div>
     </div>
