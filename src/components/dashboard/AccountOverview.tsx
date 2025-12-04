@@ -54,7 +54,7 @@ export const AccountOverview = () => {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-white/70 text-sm mb-1">Account Number</p>
-                <p className="text-lg font-semibold font-mono">{user?.accountNumber}</p>
+                <p className="text-[15px] font-semibold font-mono">{user?.accountNumber}</p>
               </div>
               <Button
                 onClick={copyAccountNumber}
