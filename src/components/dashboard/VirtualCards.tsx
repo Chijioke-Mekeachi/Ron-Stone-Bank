@@ -85,7 +85,7 @@ export const VirtualCards = () => {
           <DialogTrigger asChild>
             <Button size="sm" className="gap-2">
               <Plus className="w-4 h-4" />
-              Create Card
+              Get Card
             </Button>
           </DialogTrigger>
           <DialogContent>
