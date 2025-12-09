@@ -1,43 +1,33 @@
 import { useState, useEffect, useRef } from 'react';
-import { Send, Users, MessageCircle, Bot, User, RefreshCw, BarChart3, Mail, User as UserIcon, Shield, ShieldOff, DollarSign, CreditCard } from 'lucide-react';
+import { Send, Users, MessageCircle, Bot, User, RefreshCw, BarChart3, Mail, User as UserIcon, Shield, ShieldOff, DollarSign, CreditCard, Search, Shield as AdminIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
+import { createClient } from '@supabase/supabase-js';
 
-interface Message {
+interface ConvoMessage {
   id: string;
   user_id: string;
+  sender: 'user' | 'bot' | 'admin';
   message: string;
   created_at: string;
+  conversation_id: string;
 }
 
 interface UserConversation {
   user_id: string;
-  username: string;
-  email: string;
-  full_name: string;
-  is_active: boolean;
-  account_number: string;
-  balance: number;
+  conversation_id: string;
+  username?: string;
+  email?: string;
+  full_name?: string;
+  is_active?: boolean;
+  account_number?: string;
+  balance?: number;
   last_message: string;
   last_message_time: string;
   message_count: number;
-  is_online: boolean;
-  created_at: string;
-}
-
-interface UserDetails {
-  user_id: string;
-  username: string;
-  email: string;
-  full_name: string;
-  is_active: boolean;
-  account_number: string;
-  balance: number;
-  created_at?: string;
-  avatar_url?: string;
 }
 
 interface Stats {
@@ -53,37 +43,73 @@ interface Stats {
 }
 
 export const AdminChatPanel = () => {
-  const [users, setUsers] = useState<UserConversation[]>([]);
-  const [selectedUser, setSelectedUser] = useState<string | null>(null);
-  const [selectedUserDetails, setSelectedUserDetails] = useState<UserDetails | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [conversations, setConversations] = useState<UserConversation[]>([]);
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const [selectedUser, setSelectedUser] = useState<any>(null);
+  const [messages, setMessages] = useState<ConvoMessage[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [stats, setStats] = useState<Stats | null>(null);
-  const [activeTab, setActiveTab] = useState<'conversations' | 'stats' | 'accounts'>('conversations');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [activeTab, setActiveTab] = useState<'conversations' | 'accounts' | 'stats'>('conversations');
   const [balanceUpdate, setBalanceUpdate] = useState({ amount: '', operation: 'set' });
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [supabase, setSupabase] = useState<any>(null);
+  const [adminId, setAdminId] = useState<string>('');
+  const subscriptionRef = useRef<any>(null);
 
-  const API_BASE_URL = 'https://renostarbank.onrender.com';
-  const ADMIN_TOKEN = 'your-secret-admin-token-here';
-
+  // Initialize Supabase and get admin ID
   useEffect(() => {
-    loadUsers();
-    loadStats();
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+    
+    if (supabaseUrl && supabaseAnonKey) {
+      const client = createClient(supabaseUrl, supabaseAnonKey, {
+        realtime: {
+          params: {
+            eventsPerSecond: 10
+          }
+        }
+      });
+      setSupabase(client);
+      
+      // For demo, use a fixed admin ID or get from auth
+      // In production, get admin ID from your auth context
+      setAdminId('22222222-2222-2222-2222-222222222222'); // Example admin ID
+    }
   }, []);
 
+  // Clean up subscription on unmount
   useEffect(() => {
-    if (selectedUser) {
-      loadConversation(selectedUser);
-      loadUserDetails(selectedUser);
-      // Start polling for new messages
-      const interval = setInterval(() => {
-        loadConversation(selectedUser);
-      }, 3000);
-      return () => clearInterval(interval);
+    return () => {
+      if (subscriptionRef.current) {
+        supabase?.removeChannel(subscriptionRef.current);
+      }
+    };
+  }, [supabase]);
+
+  useEffect(() => {
+    if (supabase && adminId) {
+      loadConversations();
+      loadStats();
     }
-  }, [selectedUser]);
+  }, [supabase, adminId]);
+
+  useEffect(() => {
+    if (selectedConversationId && selectedUserId) {
+      loadMessages(selectedConversationId);
+      loadUserDetails(selectedUserId);
+      subscribeToConversation(selectedConversationId);
+    } else {
+      // Clean up subscription if no conversation selected
+      if (subscriptionRef.current) {
+        supabase?.removeChannel(subscriptionRef.current);
+        subscriptionRef.current = null;
+      }
+    }
+  }, [selectedConversationId, selectedUserId, supabase]);
 
   useEffect(() => {
     scrollToBottom();
@@ -93,22 +119,76 @@ export const AdminChatPanel = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  const loadUsers = async () => {
+  const loadConversations = async () => {
     try {
       setIsLoading(true);
-      const response = await fetch(`${API_BASE_URL}/admin/users`, {
-        headers: {
-          'admin-token': ADMIN_TOKEN
+      
+      // Get all messages to group by conversation
+      const { data: messages, error: messagesError } = await supabase
+        .from('convo')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (messagesError) throw messagesError;
+
+      // Group by user_id and get the latest conversation for each user
+      const conversationsByUser = new Map();
+      messages?.forEach((msg: ConvoMessage) => {
+        // Skip bot messages for grouping
+        if (msg.sender === 'bot') return;
+        
+        if (!conversationsByUser.has(msg.user_id)) {
+          conversationsByUser.set(msg.user_id, {
+            user_id: msg.user_id,
+            conversation_id: msg.conversation_id,
+            last_message: msg.message,
+            last_message_time: msg.created_at,
+            message_count: 1
+          });
+        } else {
+          const conv = conversationsByUser.get(msg.user_id);
+          conv.message_count += 1;
         }
       });
 
-      if (!response.ok) throw new Error('Failed to load users');
+      // Convert to array
+      const conversationArray = Array.from(conversationsByUser.values());
+      
+      // Get user details for each conversation
+      const userIds = conversationArray.map(c => c.user_id);
+      
+      if (userIds.length > 0) {
+        const { data: users, error: usersError } = await supabase
+          .from('profiles')
+          .select('*')
+          .in('id', userIds);
 
-      const data = await response.json();
-      setUsers(data.data || []);
-    } catch (error) {
-      console.error('Error loading users:', error);
-      toast.error('Failed to load users');
+        if (!usersError && users) {
+          // Merge user details with conversations
+          const merged = conversationArray.map(conv => {
+            const user = users.find(u => u.id === conv.user_id);
+            return {
+              ...conv,
+              username: user?.username || 'Unknown User',
+              email: user?.email || 'No email',
+              full_name: user?.full_name,
+              is_active: user?.is_active || false,
+              account_number: user?.account_number,
+              balance: user?.balance || 0
+            };
+          });
+
+          setConversations(merged);
+        } else {
+          setConversations(conversationArray);
+        }
+      } else {
+        setConversations([]);
+      }
+
+    } catch (error: any) {
+      console.error('Error loading conversations:', error);
+      toast.error('Failed to load conversations');
     } finally {
       setIsLoading(false);
     }
@@ -116,83 +196,166 @@ export const AdminChatPanel = () => {
 
   const loadUserDetails = async (userId: string) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/admin/users/${userId}`, {
-        headers: {
-          'admin-token': ADMIN_TOKEN
-        }
-      });
+      const { data: user, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .single();
 
-      if (!response.ok) throw new Error('Failed to load user details');
-
-      const data = await response.json();
-      setSelectedUserDetails(data.data);
-    } catch (error) {
+      if (!error && user) {
+        setSelectedUser(user);
+      } else {
+        // If no profile exists, create basic user info
+        setSelectedUser({
+          id: userId,
+          username: 'Unknown User',
+          email: 'No email',
+          is_active: false
+        });
+      }
+    } catch (error: any) {
       console.error('Error loading user details:', error);
     }
   };
 
-  const loadStats = async () => {
+  const loadMessages = async (conversationId: string) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/admin/stats`, {
-        headers: {
-          'admin-token': ADMIN_TOKEN
-        }
-      });
+      const { data, error } = await supabase
+        .from('convo')
+        .select('*')
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: true });
 
-      if (!response.ok) throw new Error('Failed to load stats');
+      if (error) throw error;
 
-      const data = await response.json();
-      setStats(data.data);
-    } catch (error) {
-      console.error('Error loading stats:', error);
+      setMessages(data || []);
+    } catch (error: any) {
+      console.error('Error loading messages:', error);
+      toast.error('Failed to load messages');
     }
   };
 
-  const loadConversation = async (userId: string) => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/admin/conversations/${userId}`, {
-        headers: {
-          'admin-token': ADMIN_TOKEN
+  const subscribeToConversation = (conversationId: string) => {
+    if (!supabase || !conversationId) return;
+
+    // Remove existing subscription
+    if (subscriptionRef.current) {
+      supabase.removeChannel(subscriptionRef.current);
+    }
+
+    // Create new subscription
+    const subscription = supabase
+      .channel(`admin_conversation:${conversationId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'convo',
+          filter: `conversation_id=eq.${conversationId}`
+        },
+        (payload: any) => {
+          // Add new message to state immediately
+          setMessages(prev => {
+            const exists = prev.some(msg => msg.id === payload.new.id);
+            if (!exists) {
+              return [...prev, payload.new];
+            }
+            return prev;
+          });
         }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'convo',
+          filter: `conversation_id=eq.${conversationId}`
+        },
+        (payload: any) => {
+          setMessages(prev =>
+            prev.map(msg =>
+              msg.id === payload.new.id ? { ...msg, ...payload.new } : msg
+            )
+          );
+        }
+      )
+      .subscribe((status: string) => {
+        console.log('Admin subscription status:', status);
       });
 
-      if (!response.ok) throw new Error('Failed to load conversation');
+    subscriptionRef.current = subscription;
+    return subscription;
+  };
 
-      const data = await response.json();
-      setMessages(data.data || []);
+  const loadStats = async () => {
+    try {
+      // Get total messages
+      const { data: messagesData, error: messagesError } = await supabase
+        .from('convo')
+        .select('id, sender, created_at', { count: 'exact' });
+
+      // Get total users (from profiles table)
+      const { data: usersData, error: usersError } = await supabase
+        .from('profiles')
+        .select('id, is_active', { count: 'exact' });
+
+      // Get today's messages
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
       
-      // Update user details if available from conversation endpoint
-      if (data.user_details && !selectedUserDetails) {
-        setSelectedUserDetails({
-          user_id: userId,
-          ...data.user_details
+      const { data: todayMessages, error: todayError } = await supabase
+        .from('convo')
+        .select('id')
+        .gte('created_at', today.toISOString());
+
+      // Get bot messages
+      const { data: botMessages, error: botError } = await supabase
+        .from('convo')
+        .select('id')
+        .eq('sender', 'bot');
+
+      if (!messagesError && !usersError) {
+        const activeAccounts = usersData?.filter(u => u.is_active).length || 0;
+        const inactiveAccounts = (usersData?.length || 0) - activeAccounts;
+
+        setStats({
+          total_messages: messagesData?.length || 0,
+          total_users: conversations.length,
+          active_users: activeAccounts,
+          messages_today: todayMessages?.length || 0,
+          bot_messages: botMessages?.length || 0,
+          user_messages: (messagesData?.length || 0) - (botMessages?.length || 0),
+          total_accounts: usersData?.length || 0,
+          active_accounts: activeAccounts,
+          inactive_accounts: inactiveAccounts
         });
       }
-    } catch (error) {
-      console.error('Error loading conversation:', error);
+    } catch (error: any) {
+      console.error('Error loading stats:', error);
     }
   };
 
   const activateAccount = async (userId: string) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/admin/users/${userId}/activate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'admin-token': ADMIN_TOKEN
-        },
-        body: JSON.stringify({ initial_balance: 1000 })
-      });
+      const { error } = await supabase
+        .from('profiles')
+        .update({ 
+          is_active: true,
+          account_number: `ACC${Date.now().toString().slice(-8)}`,
+          balance: 1000
+        })
+        .eq('id', userId);
 
-      if (!response.ok) throw new Error('Failed to activate account');
+      if (error) throw error;
 
-      const data = await response.json();
       toast.success('Account activated successfully');
-      
-      // Reload user details and users list
-      loadUserDetails(userId);
-      loadUsers();
-    } catch (error) {
+      loadConversations();
+      if (selectedUser?.id === userId) {
+        setSelectedUser({ ...selectedUser, is_active: true });
+      }
+    } catch (error: any) {
       console.error('Error activating account:', error);
       toast.error('Failed to activate account');
     }
@@ -200,23 +363,19 @@ export const AdminChatPanel = () => {
 
   const deactivateAccount = async (userId: string) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/admin/users/${userId}/deactivate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'admin-token': ADMIN_TOKEN
-        }
-      });
+      const { error } = await supabase
+        .from('profiles')
+        .update({ is_active: false })
+        .eq('id', userId);
 
-      if (!response.ok) throw new Error('Failed to deactivate account');
+      if (error) throw error;
 
-      const data = await response.json();
       toast.success('Account deactivated successfully');
-      
-      // Reload user details and users list
-      loadUserDetails(userId);
-      loadUsers();
-    } catch (error) {
+      loadConversations();
+      if (selectedUser?.id === userId) {
+        setSelectedUser({ ...selectedUser, is_active: false });
+      }
+    } catch (error: any) {
       console.error('Error deactivating account:', error);
       toast.error('Failed to deactivate account');
     }
@@ -229,56 +388,64 @@ export const AdminChatPanel = () => {
     }
 
     try {
-      const response = await fetch(`${API_BASE_URL}/admin/users/${userId}/balance`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'admin-token': ADMIN_TOKEN
-        },
-        body: JSON.stringify({
-          balance: Number(balanceUpdate.amount),
-          operation: balanceUpdate.operation
-        })
-      });
+      const { data: userData, error: fetchError } = await supabase
+        .from('profiles')
+        .select('balance')
+        .eq('id', userId)
+        .single();
 
-      if (!response.ok) throw new Error('Failed to update balance');
+      if (fetchError) throw fetchError;
 
-      const data = await response.json();
+      let newBalance = Number(balanceUpdate.amount);
+      
+      if (balanceUpdate.operation === 'add') {
+        newBalance = (userData.balance || 0) + Number(balanceUpdate.amount);
+      } else if (balanceUpdate.operation === 'subtract') {
+        newBalance = (userData.balance || 0) - Number(balanceUpdate.amount);
+      }
+
+      const { error } = await supabase
+        .from('profiles')
+        .update({ balance: newBalance })
+        .eq('id', userId);
+
+      if (error) throw error;
+
       toast.success('Balance updated successfully');
       setBalanceUpdate({ amount: '', operation: 'set' });
       
-      // Reload user details
-      loadUserDetails(userId);
-      loadUsers();
-    } catch (error) {
+      loadConversations();
+      if (selectedUser?.id === userId) {
+        setSelectedUser({ ...selectedUser, balance: newBalance });
+      }
+    } catch (error: any) {
       console.error('Error updating balance:', error);
       toast.error('Failed to update balance');
     }
   };
 
-  const sendMessageAsBot = async () => {
-    if (!newMessage.trim() || !selectedUser || isSending) return;
+  const sendMessageAsAdmin = async () => {
+    if (!newMessage.trim() || !selectedConversationId || isSending || !adminId) return;
 
     const message = newMessage.trim();
-    setNewMessage('');
     setIsSending(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/admin/conversations/${selectedUser}/messages`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'admin-token': ADMIN_TOKEN
-        },
-        body: JSON.stringify({ message })
-      });
+      const { error } = await supabase
+        .from('convo')
+        .insert({
+          user_id: adminId,
+          sender: 'admin',
+          message: message,
+          conversation_id: selectedConversationId
+        });
 
-      if (!response.ok) throw new Error('Failed to send message');
+      if (error) throw error;
 
-      // Reload conversation to show the new message
-      await loadConversation(selectedUser);
-      toast.success('Message sent as bot');
-    } catch (error) {
+      // Clear input after successful send
+      setNewMessage('');
+      toast.success('Message sent');
+    } catch (error: any) {
       console.error('Error sending message:', error);
       toast.error('Failed to send message');
     } finally {
@@ -301,16 +468,35 @@ export const AdminChatPanel = () => {
     });
   };
 
-  const getSenderName = (userId: string) => {
-    return userId === '11111111-1111-1111-1111-111111111111' ? 'Ron Stone Bot' : 
-           selectedUserDetails?.username || 'User';
+  const getSenderName = (sender: string, userId: string) => {
+    if (sender === 'bot') return 'Ron Stone Bot';
+    if (sender === 'admin') return 'You (Admin)';
+    return selectedUser?.username || 'User';
   };
 
-  const getMessageStyles = (userId: string) => {
-    return userId === '11111111-1111-1111-1111-111111111111' 
-      ? 'bg-blue-100 border border-blue-200'
-      : 'bg-gray-100 border border-gray-200 ml-auto';
+  const getMessageStyles = (sender: string) => {
+    if (sender === 'bot') {
+      return 'bg-blue-100 border border-blue-200';
+    } else if (sender === 'admin') {
+      return 'bg-green-100 border border-green-200 ml-auto';
+    } else {
+      return 'bg-gray-100 border border-gray-200';
+    }
   };
+
+  const getSenderIcon = (sender: string) => {
+    if (sender === 'bot') return <Bot className="w-4 h-4" />;
+    if (sender === 'admin') return <AdminIcon className="w-4 h-4" />;
+    return <User className="w-4 h-4" />;
+  };
+
+  const filteredConversations = conversations.filter(conv => 
+    conv.user_id !== '11111111-1111-1111-1111-111111111111' && // Exclude bot
+    (searchQuery === '' || 
+      conv.username?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      conv.email?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      conv.full_name?.toLowerCase().includes(searchQuery.toLowerCase()))
+  );
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
@@ -341,7 +527,7 @@ export const AdminChatPanel = () => {
             <BarChart3 className="w-4 h-4" />
             Statistics
           </Button>
-          <Button onClick={loadUsers} variant="outline" size="icon">
+          <Button onClick={loadConversations} variant="outline" size="icon">
             <RefreshCw className="w-4 h-4" />
           </Button>
         </div>
@@ -372,7 +558,7 @@ export const AdminChatPanel = () => {
           </Card>
           <Card>
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm font-medium">Total Users</CardTitle>
+              <CardTitle className="text-sm font-medium">Conversations</CardTitle>
               <Users className="w-4 h-4 text-muted-foreground" />
             </CardHeader>
             <CardContent>
@@ -396,44 +582,60 @@ export const AdminChatPanel = () => {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <CreditCard className="w-5 h-5" />
-              Account Management
+              Account Management ({conversations.length} users)
             </CardTitle>
           </CardHeader>
           <CardContent>
+            <div className="mb-4">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                <Input
+                  type="text"
+                  placeholder="Search users..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-10"
+                />
+              </div>
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {users.map((user) => (
-                <Card key={user.user_id} className="p-4">
+              {filteredConversations.map((conv) => (
+                <Card key={conv.user_id} className="p-4">
                   <div className="flex items-center justify-between mb-3">
                     <div>
-                      <h3 className="font-semibold">{user.username}</h3>
-                      <p className="text-sm text-gray-600">{user.email}</p>
+                      <h3 className="font-semibold">{conv.username || 'Unknown User'}</h3>
+                      <p className="text-sm text-gray-600">{conv.email || 'No email'}</p>
                     </div>
-                    <Badge variant={user.is_active ? "default" : "secondary"}>
-                      {user.is_active ? 'Active' : 'Inactive'}
+                    <Badge variant={conv.is_active ? "default" : "secondary"}>
+                      {conv.is_active ? 'Active' : 'Inactive'}
                     </Badge>
                   </div>
                   
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
                       <span>Account:</span>
-                      <span className="font-mono">{user.account_number}</span>
+                      <span className="font-mono">{conv.account_number || 'Not set'}</span>
                     </div>
                     <div className="flex justify-between">
                       <span>Balance:</span>
-                      <span className="font-mono">${user.balance}</span>
+                      <span className="font-mono">${conv.balance || 0}</span>
                     </div>
                     <div className="flex justify-between">
                       <span>Messages:</span>
-                      <span>{user.message_count}</span>
+                      <span>{conv.message_count}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Last Active:</span>
+                      <span>{formatTime(conv.last_message_time)}</span>
                     </div>
                   </div>
 
                   <div className="flex gap-2 mt-4">
-                    {user.is_active ? (
+                    {conv.is_active ? (
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => deactivateAccount(user.user_id)}
+                        onClick={() => deactivateAccount(conv.user_id)}
                         className="flex-1"
                       >
                         <ShieldOff className="w-3 h-3 mr-1" />
@@ -442,7 +644,7 @@ export const AdminChatPanel = () => {
                     ) : (
                       <Button
                         size="sm"
-                        onClick={() => activateAccount(user.user_id)}
+                        onClick={() => activateAccount(conv.user_id)}
                         className="flex-1"
                       >
                         <Shield className="w-3 h-3 mr-1" />
@@ -452,7 +654,11 @@ export const AdminChatPanel = () => {
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => setSelectedUser(user.user_id)}
+                      onClick={() => {
+                        setSelectedConversationId(conv.conversation_id);
+                        setSelectedUserId(conv.user_id);
+                        setActiveTab('conversations');
+                      }}
                     >
                       Chat
                     </Button>
@@ -465,55 +671,70 @@ export const AdminChatPanel = () => {
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        {/* Users List */}
+        {/* Conversations List */}
         <Card className="lg:col-span-1">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Users className="w-5 h-5" />
-              Users ({users.length})
+              Conversations ({filteredConversations.length})
             </CardTitle>
           </CardHeader>
           <CardContent>
+            <div className="mb-4">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                <Input
+                  type="text"
+                  placeholder="Search conversations..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-10"
+                />
+              </div>
+            </div>
             {isLoading ? (
-              <div className="text-center py-4">Loading users...</div>
-            ) : users.length === 0 ? (
-              <div className="text-center py-4 text-gray-500">No users found</div>
+              <div className="text-center py-4">Loading conversations...</div>
+            ) : filteredConversations.length === 0 ? (
+              <div className="text-center py-4 text-gray-500">No conversations found</div>
             ) : (
               <div className="space-y-2 max-h-96 overflow-y-auto">
-                {users.map((user) => (
+                {filteredConversations.map((conv) => (
                   <div
-                    key={user.user_id}
+                    key={conv.conversation_id}
                     className={`p-3 rounded-lg border cursor-pointer transition-colors ${
-                      selectedUser === user.user_id
+                      selectedConversationId === conv.conversation_id
                         ? 'bg-blue-50 border-blue-200'
                         : 'bg-white border-gray-200 hover:bg-gray-50'
                     }`}
-                    onClick={() => setSelectedUser(user.user_id)}
+                    onClick={() => {
+                      setSelectedConversationId(conv.conversation_id);
+                      setSelectedUserId(conv.user_id);
+                    }}
                   >
                     <div className="flex items-center justify-between mb-1">
                       <span className="font-medium text-sm">
-                        {user.username}
+                        {conv.username || conv.user_id.slice(0, 8)}
                       </span>
                       <div className="flex items-center gap-1">
                         <div
                           className={`w-2 h-2 rounded-full ${
-                            user.is_online ? 'bg-green-500' : 'bg-gray-300'
+                            conv.is_active ? 'bg-green-500' : 'bg-gray-300'
                           }`}
                         />
-                        <Badge variant={user.is_active ? "default" : "secondary"} className="text-xs">
-                          {user.is_active ? 'Active' : 'Inactive'}
+                        <Badge variant={conv.is_active ? "default" : "secondary"} className="text-xs">
+                          {conv.is_active ? 'Active' : 'Inactive'}
                         </Badge>
                       </div>
                     </div>
                     <p className="text-xs text-gray-600 truncate">
-                      {user.last_message}
+                      {conv.last_message}
                     </p>
                     <div className="flex items-center justify-between mt-1">
                       <p className="text-xs text-gray-400">
-                        {formatTime(user.last_message_time)}
+                        {formatTime(conv.last_message_time)}
                       </p>
                       <span className="text-xs text-gray-500">
-                        {user.message_count} msgs
+                        {conv.message_count} msgs
                       </span>
                     </div>
                   </div>
@@ -527,56 +748,56 @@ export const AdminChatPanel = () => {
         <Card className="lg:col-span-3">
           <CardHeader>
             <CardTitle>
-              {selectedUser && selectedUserDetails ? (
+              {selectedConversationId && selectedUser ? (
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
                     <div className="flex items-center gap-2">
                       <User className="w-5 h-5" />
                       <div>
                         <div className="font-semibold">
-                          {selectedUserDetails.username}
+                          {selectedUser.username || selectedUser.id.slice(0, 8)}
                         </div>
                         <div className="flex items-center gap-2 text-sm text-gray-600">
                           <Mail className="w-3 h-3" />
-                          {selectedUserDetails.email}
+                          {selectedUser.email || 'No email'}
                         </div>
                       </div>
                     </div>
-                    <Badge variant={selectedUserDetails.is_active ? "default" : "secondary"}>
-                      {selectedUserDetails.is_active ? 'Active' : 'Inactive'}
+                    <Badge variant={selectedUser.is_active ? "default" : "secondary"}>
+                      {selectedUser.is_active ? 'Active' : 'Inactive'}
                     </Badge>
-                    {selectedUserDetails.account_number && (
+                    {selectedUser.account_number && (
                       <Badge variant="outline">
-                        Acc: {selectedUserDetails.account_number}
+                        Acc: {selectedUser.account_number}
                       </Badge>
                     )}
-                    {selectedUserDetails.balance !== undefined && (
+                    {selectedUser.balance !== undefined && (
                       <Badge variant="outline">
                         <DollarSign className="w-3 h-3 mr-1" />
-                        {selectedUserDetails.balance}
+                        ${selectedUser.balance}
                       </Badge>
                     )}
                   </div>
                   <div className="text-sm text-gray-500">
-                    User since: {selectedUserDetails.created_at ? formatDate(selectedUserDetails.created_at) : 'Unknown'}
+                    Conversation ID: {selectedConversationId.slice(0, 8)}...
                   </div>
                 </div>
               ) : (
-                'Select a user to view conversation'
+                'Select a conversation to view messages'
               )}
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {selectedUser ? (
+            {selectedConversationId ? (
               <>
                 {/* Account Management Section */}
                 <div className="mb-6 p-4 border rounded-lg bg-gray-50">
                   <h3 className="font-semibold mb-3">Account Management</h3>
-                  <div className="flex gap-4 items-center">
-                    {selectedUserDetails?.is_active ? (
+                  <div className="flex flex-wrap gap-4 items-center">
+                    {selectedUser?.is_active ? (
                       <Button
                         variant="outline"
-                        onClick={() => deactivateAccount(selectedUser)}
+                        onClick={() => deactivateAccount(selectedUser.id)}
                         className="flex items-center gap-2"
                       >
                         <ShieldOff className="w-4 h-4" />
@@ -584,7 +805,7 @@ export const AdminChatPanel = () => {
                       </Button>
                     ) : (
                       <Button
-                        onClick={() => activateAccount(selectedUser)}
+                        onClick={() => activateAccount(selectedUser.id)}
                         className="flex items-center gap-2"
                       >
                         <Shield className="w-4 h-4" />
@@ -610,7 +831,7 @@ export const AdminChatPanel = () => {
                         className="w-24"
                       />
                       <Button
-                        onClick={() => updateBalance(selectedUser)}
+                        onClick={() => updateBalance(selectedUser.id)}
                         variant="outline"
                         size="sm"
                       >
@@ -629,24 +850,22 @@ export const AdminChatPanel = () => {
                     </div>
                   ) : (
                     <div className="space-y-3">
-                      {messages.map((message) => (
+                      {messages.map((msg) => (
                         <div
-                          key={message.id}
-                          className={`p-3 rounded-lg max-w-[80%] ${getMessageStyles(message.user_id)}`}
+                          key={msg.id}
+                          className={`p-3 rounded-lg max-w-[80%] ${getMessageStyles(msg.sender)} ${
+                            msg.sender === 'admin' ? 'ml-auto' : ''
+                          }`}
                         >
                           <div className="flex items-center gap-2 mb-1">
-                            {message.user_id === '11111111-1111-1111-1111-111111111111' ? (
-                              <Bot className="w-4 h-4" />
-                            ) : (
-                              <User className="w-4 h-4" />
-                            )}
+                            {getSenderIcon(msg.sender)}
                             <span className="text-xs font-medium">
-                              {getSenderName(message.user_id)}
+                              {getSenderName(msg.sender, msg.user_id)}
                             </span>
                           </div>
-                          <div className="text-sm">{message.message}</div>
+                          <div className="text-sm">{msg.message}</div>
                           <p className="text-xs text-gray-500 mt-1">
-                            {formatTime(message.created_at)}
+                            {formatTime(msg.created_at)}
                           </p>
                         </div>
                       ))}
@@ -660,25 +879,25 @@ export const AdminChatPanel = () => {
                   <Input
                     value={newMessage}
                     onChange={(e) => setNewMessage(e.target.value)}
-                    onKeyPress={(e) => e.key === 'Enter' && sendMessageAsBot()}
-                    placeholder="Type your message as Ron Stone Bot..."
+                    onKeyPress={(e) => e.key === 'Enter' && sendMessageAsAdmin()}
+                    placeholder="Type your message as admin..."
                     className="flex-1"
                     disabled={isSending}
                   />
                   <Button
-                    onClick={sendMessageAsBot}
+                    onClick={sendMessageAsAdmin}
                     disabled={!newMessage.trim() || isSending}
                     className="flex items-center gap-2"
                   >
                     <Send className="w-4 h-4" />
-                    Send as Bot
+                    Send as Admin
                   </Button>
                 </div>
               </>
             ) : (
               <div className="text-center py-12 text-gray-500">
                 <MessageCircle className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                <p>Select a user from the list to view and manage their conversation</p>
+                <p>Select a conversation from the list to view and manage messages</p>
               </div>
             )}
           </CardContent>

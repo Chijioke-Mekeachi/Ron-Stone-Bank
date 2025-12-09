@@ -5,123 +5,74 @@ import { Input } from '@/components/ui/input';
 import { useAuth } from '@/contexts/AuthContext';
 import { toast } from 'sonner';
 import { createClient } from '@supabase/supabase-js';
+import { v4 as uuidv4 } from 'uuid';
 
-interface Message {
+interface ConvoMessage {
   id: string;
   user_id: string;
+  sender: 'user' | 'bot' | 'admin';
   message: string;
   created_at: string;
+  conversation_id: string;
 }
 
 export const ChatSupport = () => {
   const { user } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const [message, setMessage] = useState('');
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<ConvoMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const supabaseRef = useRef<any>(null);
-
-  // --- ADDED: state to track if the bot has already replied to this user
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const [botHasReplied, setBotHasReplied] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [supabase, setSupabase] = useState<any>(null);
+  const subscriptionRef = useRef<any>(null);
 
-  // Your existing server URL
-  const API_BASE_URL = 'https://renostarbank.onrender.com';
-  
-  // Admin UUID for bot messages
-  const BOT_USER_ID = '11111111-1111-1111-1111-111111111111';
-
-  // Initialize Supabase client for real-time
+  // Initialize Supabase
   useEffect(() => {
-    const url = import.meta.env.VITE_SUPABASE_URL;
-    const anon = import.meta.env.VITE_SUPABASE_ANON_KEY;
-
-    if (url && anon) {
-      supabaseRef.current = createClient(url, anon);
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+    
+    if (supabaseUrl && supabaseAnonKey) {
+      const client = createClient(supabaseUrl, supabaseAnonKey, {
+        realtime: {
+          params: {
+            eventsPerSecond: 10
+          }
+        }
+      });
+      setSupabase(client);
     }
   }, []);
 
-
-  // Real-time subscription setup
+  // Clean up subscription on unmount
   useEffect(() => {
-    if (!isOpen || !user?.id || !supabaseRef.current) return;
-
-    let subscription: any;
-
-    const setupRealtime = async () => {
-      try {
-        subscription = supabaseRef.current
-          .channel('public:messages')
-          .on(
-            'postgres_changes',
-            {
-              event: 'INSERT',
-              schema: 'public',
-              table: 'messages',
-              filter: `user_id=eq.${user.id}`
-            },
-            (payload: any) => {
-              setMessages(prev => {
-                const exists = prev.some(msg => msg.id === payload.new.id);
-                if (!exists) {
-                  return [...prev, payload.new];
-                }
-                return prev;
-              });
-            }
-          )
-          .on(
-            'postgres_changes',
-            {
-              event: 'INSERT',
-              schema: 'public',
-              table: 'messages',
-              filter: `user_id=eq.${BOT_USER_ID}`
-            },
-            (payload: any) => {
-              setMessages(prev => {
-                const exists = prev.some(msg => msg.id === payload.new.id);
-                if (!exists) {
-                  return [...prev, payload.new];
-                }
-                return prev;
-              });
-              // --- ADDED: Set the local tracker when a bot message is inserted
-              if (payload.new && payload.new.user_id === BOT_USER_ID) {
-                setBotHasReplied(true);
-              }
-            }
-          )
-          .subscribe((status: string) => {
-            // console.log('📡 Realtime subscription status:', status);
-          });
-
-      } catch (error) {
-        // console.error('❌ Error setting up real-time subscription:', error);
-      }
-    };
-
-    setupRealtime();
-
     return () => {
-      if (subscription) {
-        supabaseRef.current.removeChannel(subscription);
+      if (subscriptionRef.current) {
+        supabase?.removeChannel(subscriptionRef.current);
       }
     };
-  }, [isOpen, user?.id]);
+  }, [supabase]);
 
+  // Load or create conversation when user opens chat
   useEffect(() => {
-    if (isOpen && user) {
+    if (isOpen && user && supabase) {
       initializeChat();
     } else {
-      // Reset state when closing
       setMessages([]);
+      setConversationId(null);
       setError(null);
-      setBotHasReplied(false); // --- ADDED
+      setBotHasReplied(false);
+      
+      // Clean up subscription
+      if (subscriptionRef.current) {
+        supabase?.removeChannel(subscriptionRef.current);
+        subscriptionRef.current = null;
+      }
     }
-  }, [isOpen, user]);
+  }, [isOpen, user, supabase]);
 
   useEffect(() => {
     scrollToBottom();
@@ -131,95 +82,124 @@ export const ChatSupport = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  const testApiConnection = async (): Promise<boolean> => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/health`);
-      if (response.ok) {
-        const data = await response.json();
-        return data.status === 'OK';
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  };
-
   const initializeChat = async () => {
     try {
       setIsLoading(true);
       setError(null);
-      
-      // Test if API is available
-      const apiWorking = await testApiConnection();
-      if (!apiWorking) {
-        setError('Chat service is currently unavailable. Please try again later.');
-        return;
-      }
 
       if (!user?.id) {
         setError('Please log in to use chat support');
         return;
       }
 
-      // Load existing messages for this user, checks if bot has replied
-      await fetchUserMessages();
-      
-    } catch (error) {
+      // Check if user already has a conversation
+      const { data: existingMessages, error: messagesError } = await supabase
+        .from('convo')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: true });
+
+      if (messagesError) throw messagesError;
+
+      if (existingMessages && existingMessages.length > 0) {
+        // Use existing conversation
+        const convId = existingMessages[0].conversation_id;
+        setConversationId(convId);
+        setMessages(existingMessages);
+        
+        // Check if bot has replied in this conversation (not counting welcome message)
+        const hasBotReply = existingMessages.some(msg => 
+          msg.sender === 'bot' && !msg.message.includes("Hello! I'm Ron Stone Bot")
+        );
+        setBotHasReplied(hasBotReply);
+        
+        // Subscribe to new messages
+        await subscribeToConversation(convId);
+      } else {
+        // Create new conversation with welcome message
+        await createNewConversation();
+      }
+
+    } catch (error: any) {
+      console.error('Error initializing chat:', error);
       setError('Failed to initialize chat. Please try again.');
+      toast.error('Chat initialization failed');
     } finally {
       setIsLoading(false);
     }
   };
 
-  // --- MODIFIED: Check if a bot reply exists already (for this user!)
-  const fetchUserMessages = async () => {
+  const createNewConversation = async () => {
     try {
-      if (!user?.id) return;
-      const response = await fetch(`${API_BASE_URL}/messages/${user.id}`);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      const data = await response.json();
-      if (data.success && data.data) {
-        setMessages(data.data);
-        // ADDED: Check if there is ANY bot message that's a reply (not just greeting)
-        // You may want stricter logic, e.g. checking if bot's message is after a user message.
-        const botReplyExists = data.data.some(msg =>
-          msg.user_id === BOT_USER_ID && !msg.message.includes("Hello! I\'m Ron Stone Bot")
-        );
-        setBotHasReplied(botReplyExists);
-      } else {
-        setBotHasReplied(false);
-        await addWelcomeMessage();
-      }
-    } catch (error) {
-      setError('Failed to load messages');
-      setBotHasReplied(false);
-      await addWelcomeMessage();
+      const newConversationId = uuidv4();
+      setConversationId(newConversationId);
+
+      // Add welcome message
+      const welcomeMessage = {
+        user_id: '11111111-1111-1111-1111-111111111111', // Bot ID
+        sender: 'bot' as const,
+        message: 'Hello! I\'m Ron Stone Bot. How can I assist you with your banking needs today?',
+        conversation_id: newConversationId
+      };
+
+      const { data, error } = await supabase
+        .from('convo')
+        .insert(welcomeMessage)
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      setMessages([data]);
+      await subscribeToConversation(newConversationId);
+    } catch (error: any) {
+      console.error('Error creating conversation:', error);
+      throw error;
     }
   };
 
-  const addWelcomeMessage = async () => {
-    try {
-      // Prevent duplicate greeting messages
-      const hasWelcome = messages.some(msg => 
-        msg.user_id === BOT_USER_ID && 
-        msg.message.includes('Hello! I\'m Ron Stone Bot')
-      );
-      
-      if (!hasWelcome) {
-        const welcomeMessage = await sendMessageToAPI(BOT_USER_ID, 'Hello! I\'m Ron Stone Bot. How can I assist you with your banking needs today?');
-        setMessages(prev => [...prev, welcomeMessage]);
-      }
-    } catch (error) {
-      const localWelcome: Message = {
-        id: `welcome-${Date.now()}`,
-        user_id: BOT_USER_ID,
-        message: 'Hello! I\'m Ron Stone Bot. How can I assist you with your banking needs today?',
-        created_at: new Date().toISOString(),
-      };
-      setMessages(prev => [...prev, localWelcome]);
+  const subscribeToConversation = async (conversationId: string) => {
+    if (!supabase) return;
+
+    // Remove existing subscription
+    if (subscriptionRef.current) {
+      supabase.removeChannel(subscriptionRef.current);
     }
+
+    // Create new subscription
+    const subscription = supabase
+      .channel(`conversation:${conversationId}:${user?.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'convo',
+          filter: `conversation_id=eq.${conversationId}`
+        },
+        (payload: any) => {
+          // Add new message to state
+          setMessages(prev => {
+            const exists = prev.some(msg => msg.id === payload.new.id);
+            if (!exists) {
+              return [...prev, payload.new];
+            }
+            return prev;
+          });
+
+          // Check if this is a bot reply (not welcome message)
+          if (payload.new.sender === 'bot' && 
+              !payload.new.message.includes("Hello! I'm Ron Stone Bot")) {
+            setBotHasReplied(true);
+          }
+        }
+      )
+      .subscribe((status: string) => {
+        console.log('Subscription status:', status);
+      });
+
+    subscriptionRef.current = subscription;
+    return subscription;
   };
 
   const getBotResponse = (userMessage: string): string => {
@@ -243,31 +223,8 @@ export const ChatSupport = () => {
     }
   };
 
-  // Send message to Supabase backend
-  const sendMessageToAPI = async (userId: string, messageText: string): Promise<Message> => {
-    const response = await fetch(`${API_BASE_URL}/messages`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        userId: userId,
-        message: messageText
-      }),
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-    return data.data;
-  };
-
-  // --- MODIFIED: Only send bot response if botHasReplied is false
   const handleSend = async () => {
-    if (!message.trim() || isSending || !user?.id) return;
+    if (!message.trim() || isSending || !user?.id || !conversationId) return;
 
     const userMessage = message.trim();
     setMessage('');
@@ -275,38 +232,47 @@ export const ChatSupport = () => {
     setError(null);
 
     try {
-      // Send user message to backend
-      const savedUserMessage = await sendMessageToAPI(user.id, userMessage);
-      setMessages(prev => [...prev, savedUserMessage]);
-      
-      // --- APPLY BOT-ONCE-ONLY LOGIC
-      // Only send bot response once per user (if botHasReplied is false!)
-      if (!botHasReplied) {
-        // Show thinking...
-        const thinkingMessage: Message = {
-          id: `thinking-${Date.now()}`,
-          user_id: BOT_USER_ID,
-          message: 'Thinking...',
-          created_at: new Date().toISOString(),
-        };
-        setMessages(prev => [...prev, thinkingMessage]);
+      // Send user message
+      const userMsg = {
+        user_id: user.id,
+        sender: 'user' as const,
+        message: userMessage,
+        conversation_id: conversationId
+      };
 
+      const { error: sendError } = await supabase
+        .from('convo')
+        .insert(userMsg);
+
+      if (sendError) throw sendError;
+
+      // Only send bot response if bot hasn't replied yet (and not counting welcome message)
+      if (!botHasReplied) {
+        // Wait a bit before bot responds
         setTimeout(async () => {
-          const botResponseText = getBotResponse(userMessage);
           try {
-            const botResponse = await sendMessageToAPI(BOT_USER_ID, botResponseText);
-            setMessages(prev => prev.filter(msg => !msg.id.startsWith('thinking-')));
-            setBotHasReplied(true); // --- Once bot has replied, record this!
+            // Send bot response
+            const botResponse = getBotResponse(userMessage);
+            const botMsg = {
+              user_id: '11111111-1111-1111-1111-111111111111',
+              sender: 'bot' as const,
+              message: botResponse,
+              conversation_id: conversationId
+            };
+
+            await supabase
+              .from('convo')
+              .insert(botMsg);
+            
+            // Bot has now replied, no more bot messages
+            setBotHasReplied(true);
           } catch (error) {
-            setMessages(prev => prev.filter(msg => !msg.id.startsWith('thinking-')));
-            toast.error('Failed to get bot response');
+            console.error('Error sending bot response:', error);
           }
         }, 1500);
-
       }
-      // If botHasReplied is true, do nothing else (user message just stores, NO bot reply)
-
-    } catch (error) {
+    } catch (error: any) {
+      console.error('Error sending message:', error);
       setError('Failed to send message');
       toast.error('Failed to send message');
     } finally {
@@ -321,19 +287,26 @@ export const ChatSupport = () => {
     });
   };
 
-  const getSenderIcon = (messageUserId: string) => {
-    return messageUserId === user?.id ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />;
+  const getSenderIcon = (sender: string) => {
+    if (sender === 'user') return <User className="w-4 h-4" />;
+    if (sender === 'bot') return <Bot className="w-4 h-4" />;
+    return <User className="w-4 h-4" />; // Admin icon
   };
 
-  const getSenderName = (messageUserId: string) => {
-    return messageUserId === user?.id ? 'You' : 'Ron Stone Bot';
+  const getSenderName = (sender: string, userId: string) => {
+    if (sender === 'user') return 'You';
+    if (sender === 'bot') return 'Ron Stone Bot';
+    if (sender === 'admin') return 'Support Agent';
+    return 'Unknown';
   };
 
-  const getMessageStyles = (messageUserId: string) => {
-    if (messageUserId === user?.id) {
+  const getMessageStyles = (sender: string) => {
+    if (sender === 'user') {
       return 'bg-gradient-primary text-white ml-auto';
-    } else {
+    } else if (sender === 'bot') {
       return 'bg-card border border-border';
+    } else {
+      return 'bg-green-100 border border-green-200';
     }
   };
 
@@ -341,7 +314,7 @@ export const ChatSupport = () => {
     <>
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="fixed bottom-6 right-6 w-16 h-16 bg-gradient-primary rounded-full shadow-[var(--shadow-gold)] flex items-center justify-center text-white hover:scale-110 transition-transform durati[...]
+        className="fixed bottom-6 right-6 w-16 h-16 bg-gradient-primary rounded-full shadow-[var(--shadow-gold)] flex items-center justify-center text-white hover:scale-110 transition-transform duration-200 z-50"
       >
         {isOpen ? <X className="w-6 h-6" /> : <MessageCircle className="w-6 h-6" />}
       </button>
@@ -356,7 +329,7 @@ export const ChatSupport = () => {
                 <h3 className="font-semibold text-lg">Ron Stone Support</h3>
                 <p className="text-sm text-white/80 flex items-center gap-1">
                   <div className="w-2 h-2 rounded-full animate-pulse bg-green-400"></div>
-                  AI Assistant • 24/7 • Live
+                  {botHasReplied ? 'Admin Support' : 'AI Assistant'} • 24/7 • Live
                 </p>
               </div>
             </div>
@@ -396,21 +369,18 @@ export const ChatSupport = () => {
                 {messages.map((msg) => (
                   <div
                     key={msg.id}
-                    className={`p-3 rounded-lg max-w-[85%] ${getMessageStyles(msg.user_id)} ${
-                      msg.id.includes('thinking') ? 'opacity-70' : ''
+                    className={`p-3 rounded-lg max-w-[85%] ${getMessageStyles(msg.sender)} ${
+                      msg.sender === 'user' ? 'ml-auto' : ''
                     }`}
                   >
                     <div className="flex items-center gap-2 mb-1">
-                      {getSenderIcon(msg.user_id)}
+                      {getSenderIcon(msg.sender)}
                       <span className="text-xs font-medium opacity-80">
-                        {getSenderName(msg.user_id)}
+                        {getSenderName(msg.sender, msg.user_id)}
                       </span>
                     </div>
                     <div className="text-sm">
                       {msg.message}
-                      {msg.id.includes('thinking') && (
-                        <span className="inline-block ml-1 animate-pulse">...</span>
-                      )}
                     </div>
                     <p className="text-xs opacity-70 mt-1">
                       {formatTime(msg.created_at)}
@@ -427,7 +397,7 @@ export const ChatSupport = () => {
                 value={message}
                 onChange={(e) => setMessage(e.target.value)}
                 onKeyPress={(e) => e.key === 'Enter' && handleSend()}
-                placeholder="Type your message..."
+                placeholder={botHasReplied ? "Waiting for admin response..." : "Type your message..."}
                 className="flex-1"
                 disabled={isSending || isLoading || !user || !!error}
               />
@@ -444,9 +414,14 @@ export const ChatSupport = () => {
                 Please log in to use chat support
               </p>
             )}
-            <p className="text-xs text-green-600 mt-2 text-center">
-              ✓ Real-time updates enabled
-            </p>
+            <div className="flex justify-between items-center mt-2">
+              <p className="text-xs text-green-600">
+                ✓ Real-time chat enabled
+              </p>
+              <p className="text-xs text-gray-500">
+                {botHasReplied ? 'Admin support mode' : 'AI bot mode'}
+              </p>
+            </div>
           </div>
         </div>
       )}
