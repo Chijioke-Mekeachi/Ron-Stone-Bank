@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Send, Users, MessageCircle, Bot, User, RefreshCw, BarChart3, Mail, User as UserIcon, Shield, ShieldOff, DollarSign, CreditCard, Search, Shield as AdminIcon } from 'lucide-react';
+import { Send, Users, MessageCircle, Bot, User, RefreshCw, BarChart3, Mail, User as UserIcon, Shield, ShieldOff, DollarSign, CreditCard, Search, Shield as AdminIcon, Lock, Eye, EyeOff, LogOut } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -42,6 +42,11 @@ interface Stats {
   inactive_accounts: number;
 }
 
+interface LoginForm {
+  username: string;
+  password: string;
+}
+
 export const AdminChatPanel = () => {
   const [conversations, setConversations] = useState<UserConversation[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
@@ -55,10 +60,23 @@ export const AdminChatPanel = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeTab, setActiveTab] = useState<'conversations' | 'accounts' | 'stats'>('conversations');
   const [balanceUpdate, setBalanceUpdate] = useState({ amount: '', operation: 'set' });
+  const [loginForm, setLoginForm] = useState<LoginForm>({ username: '', password: '' });
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [loginError, setLoginError] = useState('');
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [supabase, setSupabase] = useState<any>(null);
   const [adminId, setAdminId] = useState<string>('');
   const subscriptionRef = useRef<any>(null);
+
+  // Check for existing session on mount
+  useEffect(() => {
+    const storedLogin = localStorage.getItem('admin_logged_in');
+    if (storedLogin === 'true') {
+      setIsLoggedIn(true);
+    }
+  }, []);
 
   // Initialize Supabase and get admin ID
   useEffect(() => {
@@ -81,6 +99,14 @@ export const AdminChatPanel = () => {
     }
   }, []);
 
+  // Load data when logged in
+  useEffect(() => {
+    if (isLoggedIn && supabase && adminId) {
+      loadConversations();
+      loadStats();
+    }
+  }, [isLoggedIn, supabase, adminId]);
+
   // Clean up subscription on unmount
   useEffect(() => {
     return () => {
@@ -91,14 +117,7 @@ export const AdminChatPanel = () => {
   }, [supabase]);
 
   useEffect(() => {
-    if (supabase && adminId) {
-      loadConversations();
-      loadStats();
-    }
-  }, [supabase, adminId]);
-
-  useEffect(() => {
-    if (selectedConversationId && selectedUserId) {
+    if (selectedConversationId && selectedUserId && isLoggedIn) {
       loadMessages(selectedConversationId);
       loadUserDetails(selectedUserId);
       subscribeToConversation(selectedConversationId);
@@ -109,7 +128,7 @@ export const AdminChatPanel = () => {
         subscriptionRef.current = null;
       }
     }
-  }, [selectedConversationId, selectedUserId, supabase]);
+  }, [selectedConversationId, selectedUserId, supabase, isLoggedIn]);
 
   useEffect(() => {
     scrollToBottom();
@@ -117,6 +136,42 @@ export const AdminChatPanel = () => {
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError('');
+    setIsLoggingIn(true);
+
+    try {
+      // Simulate API call delay
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      if (loginForm.username === 'admin' && loginForm.password === 'password') {
+        setIsLoggedIn(true);
+        localStorage.setItem('admin_logged_in', 'true');
+        toast.success('Successfully logged in as admin');
+      } else {
+        setLoginError('Invalid username or password');
+        toast.error('Login failed');
+      }
+    } catch (error) {
+      setLoginError('Login failed. Please try again.');
+      toast.error('Login failed');
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleLogout = () => {
+    setIsLoggedIn(false);
+    localStorage.removeItem('admin_logged_in');
+    setSelectedConversationId(null);
+    setSelectedUserId(null);
+    setSelectedUser(null);
+    setMessages([]);
+    setConversations([]);
+    toast.success('Successfully logged out');
   };
 
   const loadConversations = async () => {
@@ -498,10 +553,113 @@ export const AdminChatPanel = () => {
       conv.full_name?.toLowerCase().includes(searchQuery.toLowerCase()))
   );
 
+  // Login Screen
+  if (!isLoggedIn) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 flex items-center justify-center p-4">
+        <Card className="w-full max-w-md shadow-xl">
+          <CardHeader className="space-y-1">
+            <div className="flex justify-center mb-6">
+              <div className="w-16 h-16 bg-gradient-primary rounded-full flex items-center justify-center">
+                <Shield className="w-8 h-8 text-white" />
+              </div>
+            </div>
+            <CardTitle className="text-2xl font-bold text-center">Admin Login</CardTitle>
+            <p className="text-sm text-gray-500 text-center">
+              Enter your credentials to access the admin panel
+            </p>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div className="space-y-2">
+                <label htmlFor="username" className="text-sm font-medium">
+                  Username
+                </label>
+                <div className="relative">
+                  <User className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                  <Input
+                    id="username"
+                    type="text"
+                    placeholder="Enter username"
+                    value={loginForm.username}
+                    onChange={(e) => setLoginForm(prev => ({ ...prev, username: e.target.value }))}
+                    className="pl-10"
+                    required
+                    autoComplete="username"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label htmlFor="password" className="text-sm font-medium">
+                  Password
+                </label>
+                <div className="relative">
+                  <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                  <Input
+                    id="password"
+                    type={showPassword ? "text" : "password"}
+                    placeholder="Enter password"
+                    value={loginForm.password}
+                    onChange={(e) => setLoginForm(prev => ({ ...prev, password: e.target.value }))}
+                    className="pl-10 pr-10"
+                    required
+                    autoComplete="current-password"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                  >
+                    {showPassword ? (
+                      <EyeOff className="w-4 h-4" />
+                    ) : (
+                      <Eye className="w-4 h-4" />
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {loginError && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
+                  <p className="text-sm text-red-600 text-center">{loginError}</p>
+                </div>
+              )}
+
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={isLoggingIn}
+              >
+                {isLoggingIn ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />
+                    Logging in...
+                  </>
+                ) : (
+                  'Login'
+                )}
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  // Admin Panel (logged in)
   return (
     <div className="p-6 max-w-7xl mx-auto">
       <div className="flex justify-between items-center mb-6">
-        <h1 className="text-3xl font-bold text-gray-900">Admin Panel</h1>
+        <div className="flex items-center gap-3">
+          <div className="w-12 h-12 bg-gradient-primary rounded-full flex items-center justify-center">
+            <Shield className="w-6 h-6 text-white" />
+          </div>
+          <div>
+            <h1 className="text-3xl font-bold text-gray-900">Admin Panel</h1>
+            <p className="text-sm text-gray-500">Welcome back, Admin</p>
+          </div>
+        </div>
         <div className="flex gap-2">
           <Button
             variant={activeTab === 'conversations' ? 'default' : 'outline'}
@@ -529,6 +687,10 @@ export const AdminChatPanel = () => {
           </Button>
           <Button onClick={loadConversations} variant="outline" size="icon">
             <RefreshCw className="w-4 h-4" />
+          </Button>
+          <Button onClick={handleLogout} variant="destructive" className="flex items-center gap-2">
+            <LogOut className="w-4 h-4" />
+            Logout
           </Button>
         </div>
       </div>
